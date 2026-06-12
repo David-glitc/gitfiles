@@ -1,5 +1,11 @@
-import { createFileRoute } from "@tanstack/react-router";
+import { createFileRoute, Link } from "@tanstack/react-router";
 import { useEffect, useState } from "react";
+import { generateRepoInsight } from "@/lib/api/ai.functions";
+import {
+  getCachedAnalysis,
+  isCacheFresh,
+  saveCachedAnalysis,
+} from "@/lib/cache";
 import {
   Area,
   AreaChart,
@@ -11,16 +17,22 @@ import {
   YAxis,
 } from "recharts";
 import { ConnectGitHubModal } from "@/components/ConnectGitHubModal";
+import { LandingShowcase } from "@/components/LandingShowcase";
+import { seoLinks, seoMeta } from "@/lib/seo";
 import {
   analyzeRepo,
+  analysisInsightPayload,
   clearHistory,
+  fetchRepoMeta,
   formatCompact,
+  getLastRateLimit,
   isTracked,
   loadHistory,
   loadToken,
   loadTracked,
   loadViewer,
   maybeSnapshot,
+  parseRepoPath,
   pushHistory,
   saveToken,
   saveViewer,
@@ -29,27 +41,20 @@ import {
   type Analysis,
   type CommitRow,
   type HistoryItem,
+  type RateLimitInfo,
+  type RepoMeta,
   type TrackedRepo,
   type Viewer,
 } from "@/lib/github";
 
 export const Route = createFileRoute("/")({
+  validateSearch: (s: Record<string, unknown>) => ({
+    repo: typeof s.repo === "string" ? s.repo : undefined,
+  }),
   head: () => ({
-    meta: [
-      { title: "GitFiles — Understand Your Code Evolution" },
-      {
-        name: "description",
-        content:
-          "Deep GitHub analytics: LOC growth, commit-level table, languages, contributors, and AI-impact scoring.",
-      },
-      { property: "og:title", content: "GitFiles — Understand Your Code Evolution" },
-      {
-        property: "og:description",
-        content:
-          "Deep GitHub analytics: LOC growth, commit-level table, languages, contributors, and AI-impact scoring.",
-      },
-    ],
+    meta: seoMeta({ path: "/" }),
     links: [
+      ...seoLinks("/"),
       {
         rel: "stylesheet",
         href: "https://fonts.googleapis.com/css2?family=Geist:wght@500;600&family=Hanken+Grotesk:wght@700;800;900&family=Inter:wght@400&display=swap",
@@ -64,10 +69,14 @@ export const Route = createFileRoute("/")({
 });
 
 function Index() {
-  const [input, setInput] = useState("");
+  const { repo: repoFromUrl } = Route.useSearch();
+  const [input, setInput] = useState(repoFromUrl ?? "");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [meta, setMeta] = useState<RepoMeta | null>(null);
   const [data, setData] = useState<Analysis | null>(null);
+  const [metaLoading, setMetaLoading] = useState(false);
+  const [analyticsLoading, setAnalyticsLoading] = useState(false);
   const [overlay, setOverlay] = useState({ commits: true, locAdded: false, velocity: false });
 
   const [history, setHistory] = useState<HistoryItem[]>([]);
@@ -75,13 +84,21 @@ function Index() {
   const [viewer, setViewer] = useState<Viewer | null>(null);
   const [tracked, setTracked] = useState<TrackedRepo[]>([]);
   const [showConnect, setShowConnect] = useState(false);
+  const [aiInsight, setAiInsight] = useState<string | null>(null);
+  const [rateLimit, setRateLimit] = useState<RateLimitInfo | null>(null);
 
   useEffect(() => {
     setToken(loadToken());
     setViewer(loadViewer());
     setHistory(loadHistory());
     setTracked(loadTracked());
+    if (repoFromUrl) lookup(repoFromUrl);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    setRateLimit(getLastRateLimit());
+  }, [data, meta]);
 
   function handleConnected(newToken: string, newViewer: Viewer) {
     setToken(newToken);
@@ -100,26 +117,71 @@ function Index() {
     setTracked(loadTracked());
   }
 
-  async function run(value: string) {
-    setLoading(true);
+  async function loadAnalytics(fullName: string, force = false) {
+    setAnalyticsLoading(true);
     setError(null);
     setData(null);
+    setAiInsight(null);
     try {
-      const result = await analyzeRepo(value, token || null);
+      const cached = getCachedAnalysis(fullName);
+      if (cached && isCacheFresh(cached.cachedAt) && !force) {
+        setData(cached.analysis);
+        setAiInsight(cached.aiInsight);
+        setTracked(maybeSnapshot(cached.analysis));
+        setRateLimit(getLastRateLimit());
+        return;
+      }
+      const result = await analyzeRepo(fullName, token || null);
       setData(result);
-      pushHistory(result.fullName);
-      setHistory(loadHistory());
       setTracked(maybeSnapshot(result));
+      setRateLimit(getLastRateLimit());
+      let insight: string | null = null;
+      try {
+        const ins = await generateRepoInsight({ data: analysisInsightPayload(result) });
+        insight = ins.insight;
+        setAiInsight(insight);
+      } catch {
+        setAiInsight(null);
+      }
+      saveCachedAnalysis(fullName, result, insight);
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : "Analytics failed.");
+    } finally {
+      setAnalyticsLoading(false);
+    }
+  }
+
+  async function lookup(value: string) {
+    setLoading(true);
+    setMetaLoading(true);
+    setError(null);
+    setMeta(null);
+    setData(null);
+    try {
+      parseRepoPath(value);
+      const repoMeta = await fetchRepoMeta(value, token || null);
+      setMeta(repoMeta);
+      pushHistory(repoMeta.fullName);
+      setHistory(loadHistory());
+      setMetaLoading(false);
+      setLoading(false);
+      void loadAnalytics(repoMeta.fullName);
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : "Something went wrong.");
-    } finally {
+      setMetaLoading(false);
       setLoading(false);
     }
   }
 
   function onSubmit(e: React.FormEvent) {
     e.preventDefault();
-    if (input.trim()) run(input);
+    if (!input.trim()) return;
+    try {
+      parseRepoPath(input);
+      lookup(input);
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : "Invalid input.");
+    }
   }
 
   return (
@@ -130,13 +192,32 @@ function Index() {
       {/* Header */}
       <header className="w-full sticky top-0 bg-black/90 backdrop-blur-md z-50 border-b border-[#303030]/60">
         <div className="max-w-[1280px] mx-auto px-6 md:px-12 flex flex-col sm:flex-row justify-between items-center h-auto sm:h-24 py-4 sm:py-0 gap-4">
-          <div
-            className="text-2xl font-black tracking-tighter"
-            style={{ fontFamily: "Hanken Grotesk, sans-serif" }}
-          >
-            GitFiles
-          </div>
+          <Link to="/" className="flex items-center gap-2.5">
+            <img src="/favicon.png" alt="" className="w-8 h-8 rounded-lg" width={32} height={32} />
+            <span
+              className="text-2xl font-black tracking-tighter"
+              style={{ fontFamily: "Hanken Grotesk, sans-serif" }}
+            >
+              GitFiles
+            </span>
+          </Link>
           <nav className="flex flex-wrap justify-center items-center gap-3">
+            {rateLimit && (
+              <span
+                className="hidden md:inline text-[10px] text-[#848484] border border-[#303030] px-3 py-2 rounded-full"
+                title="GitHub API budget"
+              >
+                API {rateLimit.remaining}/{rateLimit.limit} left
+              </span>
+            )}
+            <Link
+              to="/dashboard"
+              className="flex items-center gap-1.5 border border-[#303030] px-4 py-2.5 rounded-full text-xs font-semibold tracking-wider hover:bg-[#121212] transition"
+              style={{ fontFamily: "Geist, sans-serif" }}
+            >
+              <span className="material-symbols-outlined text-[16px]">dashboard</span>
+              Dashboard
+            </Link>
             <button
               onClick={() => setShowConnect(true)}
               className={`flex items-center gap-2 border px-4 py-2.5 rounded-full text-xs font-semibold tracking-wider transition ${
@@ -187,8 +268,48 @@ function Index() {
       />
 
       <main className="flex-grow flex flex-col items-center p-4 md:p-12 gap-12 w-full max-w-[1280px] mx-auto">
+        {/* Auth / access state */}
+        <div className="w-full max-w-4xl pt-6 md:pt-10">
+          {viewer ? (
+            <div className="flex flex-col sm:flex-row sm:items-center gap-3 px-5 py-4 rounded-2xl border border-[#00e639]/30 bg-[#00e639]/5">
+              <div className="flex items-center gap-3 min-w-0">
+                <img
+                  src={viewer.avatar}
+                  alt=""
+                  className="w-9 h-9 rounded-full border border-[#00e639]/40 flex-shrink-0"
+                />
+                <div className="text-left min-w-0">
+                  <div className="text-sm font-semibold truncate">
+                    Signed in as @{viewer.login}
+                  </div>
+                  <div className="text-xs text-[#c6c6c6]">
+                    Public repos + private repos you can access on GitHub
+                  </div>
+                </div>
+              </div>
+              <span className="sm:ml-auto text-[10px] uppercase tracking-widest text-[#00e639] whitespace-nowrap">
+                5,000 req/h · your token
+              </span>
+            </div>
+          ) : (
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 px-5 py-4 rounded-2xl border border-[#303030] bg-[#121212]">
+              <div className="text-left text-sm text-[#c6c6c6]">
+                <span className="text-white font-semibold">Public repos only.</span> Connect GitHub
+                to analyze private repositories you own or can access.
+              </div>
+              <button
+                onClick={() => setShowConnect(true)}
+                className="text-xs font-semibold text-[#00e639] hover:underline whitespace-nowrap"
+                style={{ fontFamily: "Geist, sans-serif" }}
+              >
+                Connect GitHub →
+              </button>
+            </div>
+          )}
+        </div>
+
         {/* Hero */}
-        <section className="w-full max-w-4xl text-center flex flex-col items-center gap-8 pt-8 md:pt-16">
+        <section className="w-full max-w-4xl text-center flex flex-col items-center gap-8 pt-4 md:pt-6">
           <h1
             className="text-4xl md:text-6xl font-black"
             style={{
@@ -200,9 +321,9 @@ function Index() {
             Understand Your Code Evolution.
           </h1>
           <p className="text-base md:text-lg text-[#c6c6c6] max-w-2xl leading-relaxed">
-            Visualize repository growth, drill into commit-level LOC churn, and score AI-assisted
-            authorship. Type <code className="text-[#00e639]">owner/repo</code> or a GitHub
-            username.
+            Paste a repository path — <code className="text-[#00e639]">owner/repo</code> or{" "}
+            <code className="text-[#00e639]">org/repo</code>. We show repo info first, then load
+            analytics.
           </p>
           <form
             onSubmit={onSubmit}
@@ -210,15 +331,17 @@ function Index() {
           >
             <div className="relative flex-grow">
               <span className="material-symbols-outlined absolute left-6 top-1/2 -translate-y-1/2 text-[#848484]">
-                account_circle
+                folder
               </span>
               <input
                 value={input}
                 onChange={(e) => setInput(e.target.value)}
                 disabled={loading}
                 className="w-full h-16 pl-14 pr-6 bg-[#121212] border border-[#303030] rounded-full text-white placeholder:text-[#848484] focus:outline-none focus:border-[#00e639] focus:ring-4 focus:ring-[#00e639]/10 transition disabled:opacity-60"
-                placeholder="facebook/react  or  torvalds"
+                placeholder="David-glitc/gitfiles"
                 type="text"
+                autoComplete="off"
+                spellCheck={false}
               />
             </div>
             <button
@@ -227,7 +350,7 @@ function Index() {
               className="h-16 px-8 bg-[#00e639] text-black font-semibold tracking-wider rounded-full hover:bg-[#00d033] transition whitespace-nowrap flex items-center justify-center gap-2 disabled:opacity-60"
               style={{ fontFamily: "Geist, sans-serif" }}
             >
-              {loading ? "Analyzing…" : "Analyze"}
+              {metaLoading ? "Looking up…" : "Look up repo"}
               {!loading && <span className="material-symbols-outlined">arrow_forward</span>}
             </button>
           </form>
@@ -249,7 +372,7 @@ function Index() {
                     t={t}
                     onOpen={() => {
                       setInput(t.fullName);
-                      run(t.fullName);
+                      lookup(t.fullName);
                     }}
                     onRemove={() => setTracked(untrackRepo(t.fullName))}
                   />
@@ -266,7 +389,7 @@ function Index() {
                   key={h.fullName}
                   onClick={() => {
                     setInput(h.fullName);
-                    run(h.fullName);
+                    lookup(h.fullName);
                   }}
                   className="px-3 py-1.5 rounded-full bg-[#121212] border border-[#303030] text-[#c6c6c6] hover:border-[#00e639]/40 hover:text-white transition"
                 >
@@ -287,10 +410,29 @@ function Index() {
           )}
         </section>
 
-        {loading && (
-          <div className="text-sm text-[#848484] animate-pulse">
-            Fetching repo metadata, weekly stats, and per-commit diffs…
-          </div>
+        {!meta && !metaLoading && (
+          <LandingShowcase
+            onTryDemo={() => {
+              setInput("David-glitc/gitfiles");
+              lookup("David-glitc/gitfiles");
+            }}
+          />
+        )}
+
+        {metaLoading && (
+          <div className="text-sm text-[#848484] animate-pulse">Fetching repository info…</div>
+        )}
+
+        {meta && (
+          <RepoOverview
+            meta={meta}
+            tracked={data ? isTracked(data.fullName) : isTracked(meta.fullName)}
+            analyticsLoading={analyticsLoading}
+            hasAnalytics={Boolean(data)}
+            onTrack={data ? () => setTracked(trackRepo(data)) : undefined}
+            onUntrack={() => setTracked(untrackRepo(meta.fullName))}
+            onReloadAnalytics={() => loadAnalytics(meta.fullName, true)}
+          />
         )}
 
         {data && (
@@ -301,7 +443,15 @@ function Index() {
             tracked={isTracked(data.fullName)}
             onTrack={() => setTracked(trackRepo(data))}
             onUntrack={() => setTracked(untrackRepo(data.fullName))}
+            aiInsight={aiInsight}
+            onRefresh={() => loadAnalytics(data.fullName, true)}
           />
+        )}
+
+        {meta && analyticsLoading && !data && (
+          <div className="w-full text-sm text-[#848484] animate-pulse text-center">
+            Loading charts, commits, and AI score… (stats can take up to a minute on first load)
+          </div>
         )}
       </main>
 
@@ -322,6 +472,118 @@ function Index() {
   );
 }
 
+/* ───────────────────────── Repo overview (phase 1) ───────────────────────── */
+
+function RepoOverview({
+  meta,
+  tracked,
+  analyticsLoading,
+  hasAnalytics,
+  onTrack,
+  onUntrack,
+  onReloadAnalytics,
+}: {
+  meta: RepoMeta;
+  tracked: boolean;
+  analyticsLoading: boolean;
+  hasAnalytics: boolean;
+  onTrack?: () => void;
+  onUntrack: () => void;
+  onReloadAnalytics: () => void;
+}) {
+  return (
+    <section className="w-full flex flex-col gap-4">
+      <Card>
+        <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-4">
+          <div className="text-left">
+            <div className="text-xs uppercase tracking-widest text-[#848484]">Repository</div>
+            <h2
+              className="text-2xl md:text-3xl font-black mt-1"
+              style={{ fontFamily: "Hanken Grotesk, sans-serif" }}
+            >
+              <a href={meta.url} target="_blank" rel="noreferrer" className="hover:text-[#00e639]">
+                {meta.owner}
+                <span className="text-[#848484]">/</span>
+                {meta.repo}
+              </a>
+            </h2>
+            {meta.description && (
+              <p className="text-sm text-[#c6c6c6] mt-2 max-w-2xl">{meta.description}</p>
+            )}
+          </div>
+          <div className="flex flex-wrap gap-2 text-xs items-center">
+            {meta.isPrivate && (
+              <Chip>
+                <span className="material-symbols-outlined text-[14px] mr-1">lock</span>
+                Private
+              </Chip>
+            )}
+            {meta.isFork && <Chip>Fork</Chip>}
+            {meta.primaryLanguage && (
+              <Chip>
+                <span className="w-2 h-2 rounded-full bg-[#00e639] mr-1.5" />
+                {meta.primaryLanguage}
+              </Chip>
+            )}
+            <Chip>★ {meta.stars.toLocaleString()}</Chip>
+            <Chip>⑂ {meta.forks.toLocaleString()}</Chip>
+            <Chip>{meta.openIssues.toLocaleString()} issues</Chip>
+            <Chip>{meta.defaultBranch}</Chip>
+            {meta.license && <Chip>{meta.license}</Chip>}
+          </div>
+        </div>
+        <div className="mt-6 grid grid-cols-1 sm:grid-cols-3 gap-4 text-sm">
+          <div className="rounded-2xl bg-[#121212] border border-[#303030] p-4">
+            <div className="text-[10px] uppercase tracking-widest text-[#848484]">Created</div>
+            <div className="mt-1 text-[#c6c6c6]">
+              {meta.createdAt ? new Date(meta.createdAt).toLocaleDateString() : "—"}
+            </div>
+          </div>
+          <div className="rounded-2xl bg-[#121212] border border-[#303030] p-4">
+            <div className="text-[10px] uppercase tracking-widest text-[#848484]">Last push</div>
+            <div className="mt-1 text-[#c6c6c6]">
+              {meta.updatedAt ? new Date(meta.updatedAt).toLocaleDateString() : "—"}
+            </div>
+          </div>
+          <div className="rounded-2xl bg-[#121212] border border-[#303030] p-4">
+            <div className="text-[10px] uppercase tracking-widest text-[#848484]">Watchers</div>
+            <div className="mt-1 text-[#c6c6c6]">{meta.watchers.toLocaleString()}</div>
+          </div>
+        </div>
+        <div className="mt-6 flex flex-wrap gap-3">
+          {hasAnalytics && onTrack && (
+            <button
+              onClick={tracked ? onUntrack : onTrack}
+              className={`flex items-center gap-1.5 px-4 py-2 rounded-full border text-xs font-semibold transition ${
+                tracked
+                  ? "border-[#00e639]/50 text-[#00e639] bg-[#00e639]/10"
+                  : "border-[#303030] bg-[#121212] hover:border-[#00e639]/40"
+              }`}
+              style={{ fontFamily: "Geist, sans-serif" }}
+            >
+              <span className="material-symbols-outlined text-[16px]">
+                {tracked ? "bookmark_added" : "bookmark_add"}
+              </span>
+              {tracked ? "Tracking" : "Track repo"}
+            </button>
+          )}
+          <button
+            onClick={onReloadAnalytics}
+            disabled={analyticsLoading}
+            className="flex items-center gap-1.5 px-4 py-2 rounded-full border border-[#303030] bg-[#121212] text-xs font-semibold hover:border-[#00e639]/40 disabled:opacity-50 transition"
+            style={{ fontFamily: "Geist, sans-serif" }}
+          >
+            <span className="material-symbols-outlined text-[16px]">
+              {analyticsLoading ? "hourglass_empty" : "refresh"}
+            </span>
+            {analyticsLoading ? "Loading analytics…" : hasAnalytics ? "Refresh analytics" : "Load analytics"}
+          </button>
+        </div>
+      </Card>
+    </section>
+  );
+}
+
 /* ───────────────────────── Dashboard ───────────────────────── */
 
 function Dashboard({
@@ -331,6 +593,8 @@ function Dashboard({
   tracked,
   onTrack,
   onUntrack,
+  aiInsight,
+  onRefresh,
 }: {
   data: Analysis;
   overlay: { commits: boolean; locAdded: boolean; velocity: boolean };
@@ -338,6 +602,8 @@ function Dashboard({
   tracked: boolean;
   onTrack: () => void;
   onUntrack: () => void;
+  aiInsight: string | null;
+  onRefresh: () => void;
 }) {
   return (
     <section className="w-full flex flex-col gap-8">
@@ -387,8 +653,23 @@ function Dashboard({
         </div>
       </div>
 
+      {aiInsight && (
+        <Card>
+          <SectionTitle icon="auto_awesome">AI repo summary</SectionTitle>
+          <p className="mt-3 text-sm text-[#c6c6c6] leading-relaxed">{aiInsight}</p>
+          <p className="mt-2 text-[10px] text-[#848484]">
+            Powered by Groq (free tier) when configured, otherwise on-device heuristics.
+          </p>
+        </Card>
+      )}
+
       {/* Chart */}
       <Card>
+        {data.chartNote && (
+          <div className="mb-4 text-xs text-amber-200/90 bg-amber-500/10 border border-amber-500/25 px-4 py-2 rounded-xl">
+            {data.chartNote}
+          </div>
+        )}
         <div className="flex justify-between items-center mb-6 flex-wrap gap-3">
           <div>
             <div className="text-xs uppercase tracking-widest text-[#848484]">
@@ -410,8 +691,20 @@ function Dashboard({
           </div>
         </div>
 
-        <div className="w-full h-[360px]">
-          <ResponsiveContainer width="100%" height="100%">
+        <div className="w-full h-[360px] min-h-[360px]">
+          {data.series.length === 0 ? (
+            <div className="h-full flex flex-col items-center justify-center gap-3 text-[#848484] text-sm">
+              <span className="material-symbols-outlined text-4xl">show_chart</span>
+              No chart data yet — GitHub stats may still be computing.
+              <button
+                onClick={onRefresh}
+                className="text-[#00e639] text-xs font-semibold hover:underline"
+              >
+                Retry analytics
+              </button>
+            </div>
+          ) : (
+          <ResponsiveContainer width="100%" height={360}>
             <AreaChart data={data.series} margin={{ top: 10, right: 16, left: 0, bottom: 0 }}>
               <defs>
                 <linearGradient id="loc" x1="0" y1="0" x2="0" y2="1">
@@ -487,6 +780,7 @@ function Dashboard({
               )}
             </AreaChart>
           </ResponsiveContainer>
+          )}
         </div>
       </Card>
 

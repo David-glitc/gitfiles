@@ -4,8 +4,30 @@
 // owner's GITHUB_TOKEN (never exposed to the client).
 
 import { fetchGitHubProxy } from "@/lib/api/github.functions";
+import { seriesFromCommitActivity, seriesFromRecentCommits } from "@/lib/series";
 
 const GH = "https://api.github.com";
+const COMMIT_DETAIL_SAMPLE = 8; // 8 API calls max for per-commit LOC (was 30)
+
+export type RateLimitInfo = { remaining: number; limit: number; resetAt: number };
+let lastRateLimit: RateLimitInfo | null = null;
+
+export function getLastRateLimit(): RateLimitInfo | null {
+  return lastRateLimit;
+}
+
+function captureRateLimit(res: Response) {
+  const remaining = res.headers.get("x-ratelimit-remaining");
+  const limit = res.headers.get("x-ratelimit-limit");
+  const reset = res.headers.get("x-ratelimit-reset");
+  if (remaining != null && limit != null) {
+    lastRateLimit = {
+      remaining: parseInt(remaining, 10),
+      limit: parseInt(limit, 10),
+      resetAt: reset ? parseInt(reset, 10) * 1000 : 0,
+    };
+  }
+}
 
 export type WeekPoint = {
   weekIdx: number;
@@ -45,7 +67,7 @@ export type Contributor = {
   deletions: number;
 };
 
-export type Analysis = {
+export type RepoMeta = {
   owner: string;
   repo: string;
   fullName: string;
@@ -59,6 +81,12 @@ export type Analysis = {
   createdAt: string;
   updatedAt: string;
   primaryLanguage: string | null;
+  isPrivate: boolean;
+  isFork: boolean;
+  license: string | null;
+};
+
+export type Analysis = RepoMeta & {
   series: WeekPoint[];
   totalCommitsYear: number;
   totalAdditionsYear: number;
@@ -76,6 +104,7 @@ export type Analysis = {
   aiScore: number;
   aiBreakdown: { label: string; value: number; weight: number }[];
   aiReason: string;
+  chartNote: string | null;
 };
 
 const AI_MESSAGE_PATTERNS = [
@@ -105,13 +134,27 @@ function throwGhError(status: number, rateLimited: boolean): never {
         ? "GitHub rate limit reached. Connect your GitHub account to keep going."
         : "GitHub rejected the request (403).",
     );
-  if (status === 404) throw new Error("Repository or user not found.");
+  if (status === 404)
+    throw new Error(
+      "Repository not found — or it is private. Connect GitHub to analyze private repos you can access.",
+    );
   if (status === 409) throw new Error("Repository is empty.");
   throw new Error(`GitHub API error: ${status}`);
 }
 
-async function ghJson(url: string, token: string | null, attempts = 5): Promise<any> {
-  for (let i = 0; i < attempts; i++) {
+function isStatsUrl(url: string) {
+  return url.includes("/stats/");
+}
+
+function pollDelay(attempt: number, retryAfterHeader: string | null): number {
+  if (retryAfterHeader) return Math.min(parseInt(retryAfterHeader, 10) * 1000, 10000);
+  return Math.min((2 + attempt * 0.4) * 1000, 6000);
+}
+
+async function ghJson(url: string, token: string | null, attempts?: number): Promise<any> {
+  const maxAttempts = attempts ?? (isStatsUrl(url) ? 30 : 8);
+
+  for (let i = 0; i < maxAttempts; i++) {
     if (token) {
       const res = await fetch(url, {
         headers: {
@@ -120,25 +163,36 @@ async function ghJson(url: string, token: string | null, attempts = 5): Promise<
         },
       });
       if (res.status === 202) {
-        await new Promise((r) => setTimeout(r, 1500));
+        await new Promise((r) => setTimeout(r, pollDelay(i, res.headers.get("retry-after"))));
         continue;
       }
+      captureRateLimit(res);
       if (!res.ok) {
         throwGhError(res.status, res.headers.get("x-ratelimit-remaining") === "0");
       }
       return res.json();
     }
 
-    // No user token — go through the server proxy (owner PAT fallback).
+    // No user token — server proxy polls 202s internally for /stats/ paths.
     const path = url.replace(GH, "");
-    const { status, bodyJson, rateLimited } = await fetchGitHubProxy({ data: { path } });
+    const { status, bodyJson, rateLimited, rateLimitRemaining, rateLimitLimit, rateLimitReset } =
+      await fetchGitHubProxy({ data: { path } });
+    if (rateLimitRemaining != null && rateLimitLimit != null) {
+      lastRateLimit = {
+        remaining: rateLimitRemaining,
+        limit: rateLimitLimit,
+        resetAt: rateLimitReset ? rateLimitReset * 1000 : 0,
+      };
+    }
     if (status === 202) {
-      await new Promise((r) => setTimeout(r, 1500));
-      continue;
+      if (isStatsUrl(url)) return [];
+      throw new Error("GitHub is still computing stats. Try again shortly.");
     }
     if (status < 200 || status >= 300) throwGhError(status, rateLimited);
     return bodyJson ? JSON.parse(bodyJson) : null;
   }
+
+  if (isStatsUrl(url)) return [];
   throw new Error("GitHub is still computing stats. Try again shortly.");
 }
 
@@ -156,29 +210,57 @@ export async function fetchViewer(token: string): Promise<Viewer> {
   return { login: u.login, name: u.name ?? null, avatar: u.avatar_url };
 }
 
-async function resolveRepo(
-  input: string,
-  token: string | null,
-): Promise<{ owner: string; repo: string }> {
+/** Accept only `owner/repo` or a github.com URL — not bare usernames. */
+export function parseRepoPath(input: string): { owner: string; repo: string } {
   const cleaned = input
     .trim()
     .replace(/^https?:\/\/github\.com\//, "")
-    .replace(/\.git$/, "");
-  if (cleaned.includes("/")) {
-    const [owner, repo] = cleaned.split("/");
-    return { owner, repo };
+    .replace(/\.git$/, "")
+    .replace(/\/+$/, "");
+  if (!cleaned.includes("/")) {
+    throw new Error(
+      "Enter owner/repo only — e.g. David-glitc/gitfiles. Usernames alone are not supported.",
+    );
   }
-  const repos = await ghJson(
-    `${GH}/users/${encodeURIComponent(cleaned)}/repos?per_page=100&sort=updated`,
-    token,
-  );
-  if (!Array.isArray(repos) || repos.length === 0)
-    throw new Error("That user has no public repositories.");
-  const top =
-    repos
-      .filter((r: any) => !r.fork)
-      .sort((a: any, b: any) => b.stargazers_count - a.stargazers_count)[0] ?? repos[0];
-  return { owner: top.owner.login, repo: top.name };
+  const parts = cleaned.split("/").filter(Boolean);
+  if (parts.length !== 2) {
+    throw new Error("Enter exactly owner/repo — organization or user, then repository name.");
+  }
+  const [owner, repo] = parts;
+  const nameRe = /^[a-zA-Z0-9](?:[a-zA-Z0-9._-]*[a-zA-Z0-9])?$/;
+  if (!nameRe.test(owner) || !nameRe.test(repo)) {
+    throw new Error("Invalid owner or repository name.");
+  }
+  return { owner, repo };
+}
+
+function mapRepoMeta(owner: string, repo: string, meta: Record<string, unknown>): RepoMeta {
+  const lic = meta.license as { spdx_id?: string } | null | undefined;
+  return {
+    owner,
+    repo,
+    fullName: `${owner}/${repo}`,
+    url: String(meta.html_url ?? `https://github.com/${owner}/${repo}`),
+    description: (meta.description as string | null) ?? null,
+    stars: Number(meta.stargazers_count ?? 0),
+    forks: Number(meta.forks_count ?? 0),
+    openIssues: Number(meta.open_issues_count ?? 0),
+    watchers: Number(meta.subscribers_count ?? meta.watchers_count ?? 0),
+    defaultBranch: String(meta.default_branch ?? "main"),
+    createdAt: String(meta.created_at ?? ""),
+    updatedAt: String(meta.pushed_at ?? meta.updated_at ?? ""),
+    primaryLanguage: (meta.language as string | null) ?? null,
+    isPrivate: Boolean(meta.private),
+    isFork: Boolean(meta.fork),
+    license: lic?.spdx_id && lic.spdx_id !== "NOASSERTION" ? lic.spdx_id : null,
+  };
+}
+
+/** Fast lookup — repo metadata only (no stats / commits). */
+export async function fetchRepoMeta(input: string, token: string | null): Promise<RepoMeta> {
+  const { owner, repo } = parseRepoPath(input);
+  const meta = await ghJson(`${GH}/repos/${owner}/${repo}`, token);
+  return mapRepoMeta(owner, repo, meta);
 }
 
 function median(arr: number[]): number {
@@ -203,17 +285,23 @@ async function pool<T, R>(items: T[], size: number, fn: (t: T) => Promise<R>): P
 }
 
 export async function analyzeRepo(input: string, token: string | null): Promise<Analysis> {
-  const { owner, repo } = await resolveRepo(input, token);
+  const { owner, repo } = parseRepoPath(input);
 
-  const [meta, codeFreq, commitAct, languagesRaw, contribStats, recentCommitsList] =
-    await Promise.all([
-      ghJson(`${GH}/repos/${owner}/${repo}`, token),
-      ghJson(`${GH}/repos/${owner}/${repo}/stats/code_frequency`, token),
-      ghJson(`${GH}/repos/${owner}/${repo}/stats/commit_activity`, token),
-      ghJson(`${GH}/repos/${owner}/${repo}/languages`, token),
-      ghJson(`${GH}/repos/${owner}/${repo}/stats/contributors`, token).catch(() => []),
-      ghJson(`${GH}/repos/${owner}/${repo}/commits?per_page=30`, token),
-    ]);
+  // Stats endpoints can return 202 while GitHub computes — fetch meta first, then stats.
+  const metaRaw = await ghJson(`${GH}/repos/${owner}/${repo}`, token);
+  const meta = mapRepoMeta(owner, repo, metaRaw);
+  // Stats: sequential to avoid hammering GitHub; languages + commits in parallel after.
+  const codeFreq = await ghJson(`${GH}/repos/${owner}/${repo}/stats/code_frequency`, token).catch(
+    () => [],
+  );
+  const commitAct = await ghJson(`${GH}/repos/${owner}/${repo}/stats/commit_activity`, token).catch(
+    () => [],
+  );
+  const [languagesRaw, contribStats, recentCommitsList] = await Promise.all([
+    ghJson(`${GH}/repos/${owner}/${repo}/languages`, token),
+    ghJson(`${GH}/repos/${owner}/${repo}/stats/contributors`, token).catch(() => []),
+    ghJson(`${GH}/repos/${owner}/${repo}/commits?per_page=15`, token),
+  ]);
 
   // Weekly series
   const commitByWeek = new Map<number, number>();
@@ -236,11 +324,21 @@ export async function analyzeRepo(input: string, token: string | null): Promise<
       commits: commitByWeek.get(week) ?? 0,
     };
   });
-  const series: WeekPoint[] = baseSeries.map((p: any, i: number, arr: any[]) => {
+  let series: WeekPoint[] = baseSeries.map((p: any, i: number, arr: any[]) => {
     const win = arr.slice(Math.max(0, i - 3), i + 1);
     const velocity = Math.round(win.reduce((s, x) => s + x.additions, 0) / win.length);
     return { ...p, velocity };
   });
+  let chartNote: string | null = null;
+  if (!series.length && Array.isArray(commitAct) && commitAct.length) {
+    series = seriesFromCommitActivity(commitAct);
+    chartNote =
+      "LOC stats still computing on GitHub — showing weekly commits until code frequency is ready.";
+  }
+  if (!series.length && Array.isArray(recentCommitsList) && recentCommitsList.length) {
+    series = seriesFromRecentCommits(recentCommitsList);
+    chartNote = "Weekly view built from recent commits (GitHub stats not ready yet).";
+  }
 
   const totalAdditionsYear = series.slice(-52).reduce((s, p) => s + p.additions, 0);
   const totalDeletionsYear = series.slice(-52).reduce((s, p) => s + p.deletions, 0);
@@ -288,7 +386,7 @@ export async function analyzeRepo(input: string, token: string | null): Promise<
     });
 
   // Per-commit stats (fetch in parallel for the recent slice)
-  const commitDetails = await pool(recentCommitsList.slice(0, 30), 5, async (c: any) => {
+  const commitDetails = await pool(recentCommitsList.slice(0, COMMIT_DETAIL_SAMPLE), 2, async (c: any) => {
     try {
       return await ghJson(`${GH}/repos/${owner}/${repo}/commits/${c.sha}`, token);
     } catch {
@@ -363,19 +461,7 @@ export async function analyzeRepo(input: string, token: string | null): Promise<
         : "Patterns consistent with hand-written, iterative development.";
 
   return {
-    owner,
-    repo,
-    fullName: `${owner}/${repo}`,
-    url: meta.html_url,
-    description: meta.description,
-    stars: meta.stargazers_count,
-    forks: meta.forks_count,
-    openIssues: meta.open_issues_count,
-    watchers: meta.subscribers_count ?? meta.watchers_count,
-    defaultBranch: meta.default_branch,
-    createdAt: meta.created_at,
-    updatedAt: meta.pushed_at,
-    primaryLanguage: meta.language,
+    ...meta,
     series,
     totalCommitsYear,
     totalAdditionsYear,
@@ -393,6 +479,22 @@ export async function analyzeRepo(input: string, token: string | null): Promise<
     aiScore,
     aiBreakdown: breakdown,
     aiReason,
+    chartNote,
+  };
+}
+
+/** Compact payload for LLM insight (keeps tokens low). */
+export function analysisInsightPayload(a: Analysis) {
+  return {
+    fullName: a.fullName,
+    stars: a.stars,
+    forks: a.forks,
+    primaryLanguage: a.primaryLanguage,
+    totalCommitsYear: a.totalCommitsYear,
+    netLocYear: a.netLocYear,
+    aiScore: a.aiScore,
+    topLanguages: a.languages.map((l) => l.name),
+    recentCommitSamples: a.recentCommits.map((c) => c.firstLine).filter(Boolean),
   };
 }
 

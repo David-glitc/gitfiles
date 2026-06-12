@@ -4,7 +4,7 @@
 
 - Cloned `commit-bloom-tracker`, reset git history, pushed to new repo `David-glitc/gitfiles`.
 - Added server-side GitHub proxy (`GITHUB_TOKEN`) so anonymous visitors get 5,000 req/h via owner PAT fallback.
-- Added Connect GitHub modal: PAT instructions (pre-filled token URL) + optional OAuth Device Flow (`GITHUB_OAUTH_CLIENT_ID`).
+- Added Connect GitHub modal: PAT instructions + standard OAuth redirect (`GITHUB_OAUTH_CLIENT_ID` + secret).
 - Per-account localStorage: history, tracked repos with snapshot timelines (LOC, commits, AI score, stars).
 - Track / untrack repos from the dashboard; tracked list on the home page.
 
@@ -28,7 +28,7 @@ Opens a local page → one GitHub click → `gh api POST /app-manifests/{code}/c
 
 Manual OAuth App alternative: `bun run setup:oauth -- --url` (pre-filled settings URL).
 
-After either path: app settings → Advanced → **Enable Device Flow** → Save. Verify: `bun run setup:oauth -- --check`.
+Set **Authorization callback URL** to `https://gitfiles.chessonchain.online/auth/github/callback`.
 
 Repo secret `GITFILES_GITHUB_TOKEN` set via `gh secret set` for CI/deploy.
 
@@ -43,4 +43,20 @@ Repo secret `GITFILES_GITHUB_TOKEN` set via `gh secret set` for CI/deploy.
 | Variable                 | Required   | Purpose                                   |
 | ------------------------ | ---------- | ----------------------------------------- |
 | `GITHUB_TOKEN`           | Yes (prod) | Server PAT for unauthenticated API proxy  |
-| `GITHUB_OAUTH_CLIENT_ID` | No         | Enables "Sign in with GitHub" device flow |
+| `GITHUB_OAUTH_CLIENT_ID` | No         | OAuth App client ID for GitHub redirect sign-in |
+| `GITHUB_OAUTH_CLIENT_SECRET` | No     | OAuth App secret (server-only, for code exchange) |
+| `GROQ_API_KEY`           | No         | Groq LLM for AI repo summaries            |
+
+## 2026-06-12 — SEO, OG image, landing showcase, Groq redeploy
+
+- Generated `public/og-image.png` (1200×630), favicon/apple-touch-icon from logo.
+- Centralized SEO in `src/lib/seo.ts`; fixed root meta (was Lovable defaults).
+- Added `public/robots.txt` + `public/sitemap.xml` (/, /dashboard).
+- Landing: `LandingShowcase` preview cards for `David-glitc/gitfiles` + roadmap section.
+- Redeployed Docker with `GROQ_API_KEY` in `--env-file .env`.
+
+## 2026-06-12 — OAuth redirect flow (replaces device flow)
+
+- "Continue with GitHub" now uses standard authorization-code redirect (no user code).
+- Callback route: `/auth/github/callback` — server exchanges code with `GITHUB_OAUTH_CLIENT_SECRET`.
+- Update GitHub OAuth App callback URL to match (see `.env.example`).

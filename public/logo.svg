@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <title>GitFiles</title>
+  <defs>
+    <linearGradient id="g" x1="0" y1="1" x2="0" y2="0">
+      <stop offset="0%" stop-color="#00e639" stop-opacity="0"/>
+      <stop offset="100%" stop-color="#00e639" stop-opacity="0.35"/>
+    </linearGradient>
+  </defs>
+  <!-- App tile background -->
+  <rect width="512" height="512" rx="108" fill="#000000"/>
+  <rect x="16" y="16" width="480" height="480" rx="92" fill="none" stroke="#00e639" stroke-width="8" stroke-opacity="0.45"/>
+  <!-- LOC growth area -->
+  <path d="M96 360 L160 300 L224 318 L288 220 L352 248 L416 128 L416 360 Z" fill="url(#g)"/>
+  <path d="M96 360 L160 300 L224 318 L288 220 L352 248 L416 128" fill="none" stroke="#00e639" stroke-width="20" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- Git commit graph -->
+  <circle cx="160" cy="168" r="36" fill="#00e639"/>
+  <circle cx="288" cy="128" r="36" fill="#00e639"/>
+  <circle cx="352" cy="248" r="36" fill="#00e639"/>
+  <path d="M160 168 L288 128" stroke="#ffffff" stroke-width="14" stroke-linecap="round" opacity="0.9"/>
+  <path d="M288 128 L352 248" stroke="#ffffff" stroke-width="14" stroke-linecap="round" opacity="0.9"/>
+  <!-- File tab hint -->
+  <path d="M120 392 h176 a20 20 0 0 0 20-20 v-72 a20 20 0 0 0-20-20 H120 Z" fill="none" stroke="#c6c6c6" stroke-width="12" stroke-linejoin="round"/>
+  <path d="M296 280 v-20 a20 20 0 0 0-20-20" fill="none" stroke="#c6c6c6" stroke-width="12" stroke-linecap="round"/>
+</svg>

@@ -1,5 +1,11 @@
 import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
+import {
+  buildAuthorizeUrl,
+  createOAuthState,
+  exchangeOAuthCode,
+  verifyOAuthState,
+} from "../oauth.server";
 
 // Server-side GitHub helpers.
 //
@@ -8,101 +14,111 @@ import { z } from "zod";
 //    visitor has not connected their own token, so anonymous users get
 //    5,000 req/h instead of 60. The owner token never reaches the browser.
 //
-// 2. startDeviceFlow / pollDeviceFlow — GitHub OAuth Device Flow.
-//    github.com/login/* endpoints don't send CORS headers, so the browser
-//    can't call them directly; these server functions relay the handshake.
-//    Requires GITHUB_OAUTH_CLIENT_ID (an OAuth App with device flow
-//    enabled). The resulting user token is returned to the client and
-//    stored in their browser only.
+// 2. OAuth authorization-code flow — redirect to GitHub, callback exchanges
+//    code for a user token server-side (client secret never reaches browser).
+//    Requires GITHUB_OAUTH_CLIENT_ID + GITHUB_OAUTH_CLIENT_SECRET.
 
 const ALLOWED_GH_PATH = /^\/(repos|users|search|rate_limit)\b/;
+const STATS_POLL_ATTEMPTS = 30;
+
+function statsPollDelay(attempt: number): number {
+  const retryAfter = 2;
+  return Math.min((retryAfter + attempt * 0.4) * 1000, 6000);
+}
+
+async function ghFetch(path: string, token: string | undefined) {
+  return fetch(`https://api.github.com${path}`, {
+    headers: {
+      Accept: "application/vnd.github+json",
+      "User-Agent": "gitfiles-app",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
+  });
+}
 
 export const fetchGitHubProxy = createServerFn({ method: "POST" })
   .inputValidator(z.object({ path: z.string().min(1).max(500) }))
   .handler(async ({ data }) => {
     if (!ALLOWED_GH_PATH.test(data.path) || data.path.includes("..")) {
-      return { status: 400, bodyJson: null as string | null, rateLimited: false };
+      return {
+        status: 400,
+        bodyJson: null as string | null,
+        rateLimited: false,
+        rateLimitRemaining: null,
+        rateLimitLimit: null,
+        rateLimitReset: null,
+      };
     }
     const token = process.env.GITHUB_TOKEN;
-    const res = await fetch(`https://api.github.com${data.path}`, {
-      headers: {
-        Accept: "application/vnd.github+json",
-        "User-Agent": "gitfiles-app",
-        ...(token ? { Authorization: `Bearer ${token}` } : {}),
-      },
-    });
-    const rateLimited = res.status === 403 && res.headers.get("x-ratelimit-remaining") === "0";
-    const bodyJson: string | null = res.status === 204 ? null : await res.text();
-    return { status: res.status, bodyJson, rateLimited };
+    const isStats = data.path.includes("/stats/");
+    const maxAttempts = isStats ? STATS_POLL_ATTEMPTS : 1;
+
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      const res = await ghFetch(data.path, token);
+      if (res.status === 202) {
+        const hdr = res.headers.get("retry-after");
+        const waitMs = hdr ? Math.min(parseInt(hdr, 10) * 1000, 10000) : statsPollDelay(attempt);
+        await new Promise((r) => setTimeout(r, waitMs));
+        continue;
+      }
+      const rateLimited = res.status === 403 && res.headers.get("x-ratelimit-remaining") === "0";
+      const bodyJson: string | null = res.status === 204 ? null : await res.text();
+      return { status: res.status, bodyJson, rateLimited, ...parseRateHeaders(res) };
+    }
+
+    return {
+      status: 202,
+      bodyJson: null,
+      rateLimited: false,
+      rateLimitRemaining: null,
+      rateLimitLimit: null,
+      rateLimitReset: null,
+    };
   });
 
-export const getDeviceFlowAvailability = createServerFn({ method: "GET" }).handler(async () => {
-  return { available: Boolean(process.env.GITHUB_OAUTH_CLIENT_ID) };
+function parseRateHeaders(res: Response) {
+  const remaining = res.headers.get("x-ratelimit-remaining");
+  const limit = res.headers.get("x-ratelimit-limit");
+  const reset = res.headers.get("x-ratelimit-reset");
+  return {
+    rateLimitRemaining: remaining != null ? parseInt(remaining, 10) : null,
+    rateLimitLimit: limit != null ? parseInt(limit, 10) : null,
+    rateLimitReset: reset != null ? parseInt(reset, 10) : null,
+  };
+}
+
+export const getOAuthAvailability = createServerFn({ method: "GET" }).handler(async () => {
+  return {
+    available: Boolean(
+      process.env.GITHUB_OAUTH_CLIENT_ID && process.env.GITHUB_OAUTH_CLIENT_SECRET,
+    ),
+  };
 });
 
-export const startDeviceFlow = createServerFn({ method: "POST" }).handler(async () => {
+export const getOAuthAuthorizeUrl = createServerFn({ method: "POST" }).handler(async () => {
   const clientId = process.env.GITHUB_OAUTH_CLIENT_ID;
-  if (!clientId) {
+  const clientSecret = process.env.GITHUB_OAUTH_CLIENT_SECRET;
+  if (!clientId || !clientSecret) {
     return { ok: false as const, error: "GitHub sign-in is not configured on this server." };
   }
-  const res = await fetch("https://github.com/login/device/code", {
-    method: "POST",
-    headers: { Accept: "application/json", "Content-Type": "application/json" },
-    // OAuth Apps need scope; GitHub Apps (Iv1.* client IDs) reject scopes.
-    body: JSON.stringify(
-      clientId.startsWith("Iv1.")
-        ? { client_id: clientId }
-        : { client_id: clientId, scope: "public_repo" },
-    ),
-  });
-  if (!res.ok) {
-    return { ok: false as const, error: `GitHub device flow failed (${res.status}).` };
-  }
-  const json = (await res.json()) as {
-    device_code: string;
-    user_code: string;
-    verification_uri: string;
-    expires_in: number;
-    interval: number;
-  };
-  return {
-    ok: true as const,
-    deviceCode: json.device_code,
-    userCode: json.user_code,
-    verificationUri: json.verification_uri,
-    expiresIn: json.expires_in,
-    interval: json.interval,
-  };
+  const state = createOAuthState(clientSecret);
+  return { ok: true as const, url: buildAuthorizeUrl(clientId, state) };
 });
 
-export const pollDeviceFlow = createServerFn({ method: "POST" })
-  .inputValidator(z.object({ deviceCode: z.string().min(1) }))
+export const completeOAuth = createServerFn({ method: "POST" })
+  .inputValidator(
+    z.object({
+      code: z.string().min(1),
+      state: z.string().min(1),
+    }),
+  )
   .handler(async ({ data }) => {
-    const clientId = process.env.GITHUB_OAUTH_CLIENT_ID;
-    if (!clientId) {
-      return { status: "error" as const, error: "GitHub sign-in is not configured." };
+    const clientSecret = process.env.GITHUB_OAUTH_CLIENT_SECRET;
+    if (!clientSecret) {
+      return { ok: false as const, error: "GitHub sign-in is not configured." };
     }
-    const res = await fetch("https://github.com/login/oauth/access_token", {
-      method: "POST",
-      headers: { Accept: "application/json", "Content-Type": "application/json" },
-      body: JSON.stringify({
-        client_id: clientId,
-        device_code: data.deviceCode,
-        grant_type: "urn:ietf:params:oauth:grant-type:device_code",
-      }),
-    });
-    const json = (await res.json()) as {
-      access_token?: string;
-      error?: string;
-      interval?: number;
-    };
-    if (json.access_token) return { status: "success" as const, token: json.access_token };
-    if (json.error === "authorization_pending") return { status: "pending" as const };
-    if (json.error === "slow_down")
-      return { status: "slow_down" as const, interval: json.interval ?? 10 };
-    if (json.error === "expired_token")
-      return { status: "error" as const, error: "Code expired — start over." };
-    if (json.error === "access_denied")
-      return { status: "error" as const, error: "Sign-in was cancelled on GitHub." };
-    return { status: "error" as const, error: json.error ?? "Unknown device flow error." };
+    if (!verifyOAuthState(data.state, clientSecret)) {
+      return { ok: false as const, error: "Invalid or expired sign-in session. Try again." };
+    }
+    return exchangeOAuthCode(data.code);
   });
