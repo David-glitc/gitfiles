@@ -32,6 +32,12 @@ After either path: app settings → Advanced → **Enable Device Flow** → Save
 
 Repo secret `GITFILES_GITHUB_TOKEN` set via `gh secret set` for CI/deploy.
 
+## 2026-06-12 — gitfiles.chessonchain.online live
+
+- DNS: A `gitfiles` → 109.205.181.119 (proxied) via `cloudflare-dns.mjs`.
+- Deploy: Docker `gitfiles` on `coolify` network, Traefik → port 3000, nitro `node` preset.
+- Live: https://gitfiles.chessonchain.online (verified 200).
+
 ### Env
 
 | Variable                 | Required   | Purpose                                   |
