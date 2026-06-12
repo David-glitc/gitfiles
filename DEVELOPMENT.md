@@ -16,6 +16,22 @@ cp .env.example .env   # set GITHUB_TOKEN (gh auth token works)
 bun run dev
 ```
 
+### OAuth setup via gh cli
+
+GitHub has **no REST API** to create OAuth Apps (`gh api POST /user/applications/oauth` → 404). Supported path: **GitHub App manifest flow** + `gh api` conversion:
+
+```bash
+bun run setup:oauth
+```
+
+Opens a local page → one GitHub click → `gh api POST /app-manifests/{code}/conversions` → writes `GITHUB_OAUTH_CLIENT_ID` to `.env`.
+
+Manual OAuth App alternative: `bun run setup:oauth -- --url` (pre-filled settings URL).
+
+After either path: app settings → Advanced → **Enable Device Flow** → Save. Verify: `bun run setup:oauth -- --check`.
+
+Repo secret `GITFILES_GITHUB_TOKEN` set via `gh secret set` for CI/deploy.
+
 ### Env
 
 | Variable                 | Required   | Purpose                                   |

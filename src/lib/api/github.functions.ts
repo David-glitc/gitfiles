@@ -48,7 +48,12 @@ export const startDeviceFlow = createServerFn({ method: "POST" }).handler(async 
   const res = await fetch("https://github.com/login/device/code", {
     method: "POST",
     headers: { Accept: "application/json", "Content-Type": "application/json" },
-    body: JSON.stringify({ client_id: clientId, scope: "public_repo" }),
+    // OAuth Apps need scope; GitHub Apps (Iv1.* client IDs) reject scopes.
+    body: JSON.stringify(
+      clientId.startsWith("Iv1.")
+        ? { client_id: clientId }
+        : { client_id: clientId, scope: "public_repo" },
+    ),
   });
   if (!res.ok) {
     return { ok: false as const, error: `GitHub device flow failed (${res.status}).` };
